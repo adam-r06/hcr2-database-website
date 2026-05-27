@@ -21,7 +21,8 @@ $playerId = $data['playerId'] ?? null;
 $newPlayerName = $data['newPlayerName'] ?? null;
 $country = $data['country'] ?? null;
 $playerName = $data['playerName'] ?? null;
-$tuningSetupId = $data['tuningSetupId'] ?? null;
+$tuningSetupId = null; // resolved below from parts checklist
+$partIds = $data['parts'] ?? null; // ordered array of tuning part IDs from the checklist
 $questionable = isset($data['questionable']) ? (int)$data['questionable'] : 0;
 $note = $data['note'] ?? $data['questionableReason'] ?? null;
 
@@ -80,6 +81,58 @@ try {
         $playerId = (int)$insertPlayer->fetchColumn();
     }
     
+    // --- Resolve tuning setup from parts checklist ---
+    if (!empty($partIds) && is_array($partIds)) {
+        // Sanitize: integers only, no duplicates, sorted for consistent matching
+        $partIds = array_values(array_unique(array_filter(array_map('intval', $partIds), fn($id) => $id > 0)));
+        sort($partIds);
+
+        if (!empty($partIds)) {
+            // Validate all part IDs exist
+            $placeholders = implode(',', array_fill(0, count($partIds), '?'));
+            $checkParts = $db->prepare("SELECT COUNT(*) FROM tuning_part WHERE id_tuning_part IN ($placeholders)");
+            $checkParts->execute($partIds);
+            if ((int)$checkParts->fetchColumn() !== count($partIds)) {
+                $db->rollBack();
+                echo json_encode(['error' => 'One or more tuning part IDs are invalid.']);
+                exit;
+            }
+
+            // Find an existing setup with exactly these parts (no more, no less)
+            $findSql = "
+                SELECT tsp.id_tuning_setup
+                FROM tuning_setup_parts tsp
+                WHERE tsp.id_tuning_part IN ($placeholders)
+                GROUP BY tsp.id_tuning_setup
+                HAVING COUNT(DISTINCT tsp.id_tuning_part) = ?
+                AND (
+                    SELECT COUNT(*) FROM tuning_setup_parts tsp2
+                    WHERE tsp2.id_tuning_setup = tsp.id_tuning_setup
+                ) = ?
+                LIMIT 1
+            ";
+            $findStmt = $db->prepare($findSql);
+            $findStmt->execute([...$partIds, count($partIds), count($partIds)]);
+            $existingSetupId = $findStmt->fetchColumn();
+
+            if ($existingSetupId !== false) {
+                // Reuse existing setup
+                $tuningSetupId = (int)$existingSetupId;
+            } else {
+                // Create a new tuning setup and insert its parts
+                $newSetup = $db->prepare('INSERT INTO tuning_setup DEFAULT VALUES RETURNING id_tuning_setup');
+                $newSetup->execute();
+                $tuningSetupId = (int)$newSetup->fetchColumn();
+
+                $insertPart = $db->prepare('INSERT INTO tuning_setup_parts (id_tuning_setup, id_tuning_part) VALUES (:setupId, :partId)');
+                foreach ($partIds as $partId) {
+                    $insertPart->execute([':setupId' => $tuningSetupId, ':partId' => $partId]);
+                }
+            }
+        }
+    }
+    // If no parts provided, $tuningSetupId stays null
+
     $stmt = $db->prepare('DELETE FROM world_record WHERE id_map = :idMap AND id_vehicle = :idVehicle');
     $stmt->execute([':idMap' => $mapId, ':idVehicle' => $vehicleId]);
 
@@ -118,7 +171,8 @@ try {
         'mapName' => $mapName,
         'vehicleName' => $vehicleName,
         'playerName' => $playerName,
-        'distance' => $distance
+        'distance' => $distance,
+        'tuningSetupId' => $tuningSetupId,
     ]);
 } catch (PDOException $e) {
     if ($db->inTransaction()) {
